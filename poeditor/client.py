@@ -14,14 +14,27 @@ import sys
 import tempfile
 import warnings
 
-from contextlib import nullcontext
 from datetime import datetime
 
 __all__ = ['POEditorException', 'POEditorArgsException', 'POEditorAPI']
 
 
-def parse_datetime(dt_string):
-    return datetime.strptime(dt_string, '%Y-%m-%dT%H:%M:%S%z')
+if sys.version_info < (3, 2):
+    from datetime import timedelta
+
+    def parse_datetime(dt_string):
+        # Hacky and not really equivalent to the Python3.2 version but will do for most use cases,
+        # that way we can avoid adding an extra dependency like dateutil or iso8601
+        ret = datetime.strptime(dt_string[:19], '%Y-%m-%dT%H:%M:%S')
+        if dt_string[19] == '+':
+           ret -= timedelta(hours=int(dt_string[20:22]), minutes=int(dt_string[22:]))
+        elif dt_string[19] == '-':
+           ret += timedelta(hours=int(dt_string[20:22]), minutes=int(dt_string[22:]))
+        return ret
+else:
+    # https://docs.python.org/3/whatsnew/3.2.html#datetime-and-time
+    def parse_datetime(dt_string):
+        return datetime.strptime(dt_string, '%Y-%m-%dT%H:%M:%S%z')
 
 
 class POEditorException(Exception):
@@ -58,10 +71,9 @@ class POEditorAPI(object):
     HOST = "https://api.poeditor.com/v2/"
 
     SUCCESS_CODE = "success"
-    FILE_TYPES = ['arb', 'csv', 'ini', 'key_value_json', 'json', 'po', 'pot',
-                  'mo', 'properties', 'resw', 'resx', 'ts', 'apple_strings',
-                  'xliff', 'xliff_1_2', 'xlf', 'xmb', 'xtb', 'rise_360_xliff',
-                  'xls', 'xlsx', 'android_strings', 'yml']
+    FILE_TYPES = ['po', 'pot', 'mo', 'xls', 'csv', 'resx', 'resw', 'android_strings',
+                  'apple_strings', 'xliff', 'properties', 'key_value_json', 'json',
+                  'xmb', 'xtb']
     FILTER_BY = ['translated', 'untranslated', 'fuzzy', 'not_fuzzy',
                  'automatic', 'not_automatic', 'proofread', 'not_proofread']
 
@@ -186,7 +198,7 @@ class POEditorAPI(object):
         return data['result']['project']['id']
 
     def update_project(self, project_id, name=None, description=None,
-                       reference_language=None, fallback_language=None):
+                       reference_language=None):
         """
         Updates project settings (name, description, reference language)
         If optional parameters are not sent, their respective fields are not updated.
@@ -198,8 +210,6 @@ class POEditorAPI(object):
             kwargs['description'] = description
         if reference_language is not None:
             kwargs['reference_language'] = reference_language
-        if fallback_language is not None:
-            kwargs['fallback_language'] = fallback_language
 
         data = self._run(
             url_path="projects/update",
@@ -330,10 +340,42 @@ class POEditorAPI(object):
             data=json.dumps(data)
         )
         return data['result']['terms']
+    
+    def add_translations(self, project_id, language, data):
+        data = self._run(
+            url_path="translations/add",
+            id=project_id,
+            language=language,
+            data=json.dumps(data)   
+        )
+        return data['result']['translations']
+    
 
     def update_terms(self, project_id, data, fuzzy_trigger=None):
         """
         Updates project terms. Lets you change the text, context, reference, plural and tags.
+
+        >>> data = [
+                {
+                    "term": "Add new list",
+                    "context": "",
+                    "new_term": "Save list",
+                    "new_context": "",
+                    "reference": "\/projects",
+                    "plural": "",
+                    "comment": "",
+                    "tags": [
+                        "first_tag",
+                        "second_tag"
+                    ]
+                },
+                {
+                    "term": "Display list",
+                    "context": "",
+                    "new_term": "Show list",
+                    "new_context": ""
+                }
+            ]
         """
         kwargs = {}
         if fuzzy_trigger is not None:
@@ -467,18 +509,14 @@ class POEditorAPI(object):
         return data['result']['translations']
 
     def export(self, project_id, language_code, file_type='po', filters=None,
-               tags=None, order=None, options=None, local_file=None):
+               tags=None, local_file=None):
         """
         Return terms / translations
 
         filters - filter by self._filter_by
         tags - filter results by tags;
-        order - Set it to 'terms' to order results by 'terms' alphabetically.
-        options - Set specific advanced options for particular formats (where these exist).
-            The value must be a JSON array of objects. Can be used to export in Android XML
-            format without wrapping the strings in quotes: options=[{"unquoted": 1}]
         local_file - save content into it. If None, save content into
-            random temp file. If False, don't download at all.
+            random temp file.
 
         >>> tags = 'name-of-tag'
         >>> tags = ["name-of-tag"]
@@ -505,35 +543,22 @@ class POEditorAPI(object):
             language=language_code,
             type=file_type,
             filters=filters,
-            tags=tags,
-            order=order,
-            options=options
+            tags=tags
         )
         # The link of the file (expires after 10 minutes).
         file_url = data['result']['url']
 
-        if local_file is not False:
-           
-            # Setup a file context manager
-            if local_file is None:
-                context_manager = tempfile.NamedTemporaryFile(delete=False, suffix='.{}'.format(file_type))
-                local_file = context_manager.name
-            elif callable(getattr(local_file, 'write', None)):  # Does it quack?
-                # If the caller of this export method passed a local_file writable object,
-                # it is their responsibility to eventually close it.
-                context_manager = nullcontext(local_file)
-            elif isinstance(local_file, str):
-                context_manager = open(local_file, 'w+b')
-            else:
-                raise ValueError(f"Unexpected value for local_file={local_file}")
+        # Download file content:
+        res = requests.get(file_url, stream=True)
+        if not local_file:
+            tmp_file = tempfile.NamedTemporaryFile(
+                delete=False, suffix='.{}'.format(file_type))
+            tmp_file.close()
+            local_file = tmp_file.name
 
-            # Download the file
-            res = requests.get(file_url, stream=True)
-
-            with context_manager as f:
-                for data in res.iter_content(chunk_size=1024):
-                    f.write(data)
-
+        with open(local_file, 'w+b') as po_file:
+            for data in res.iter_content(chunk_size=1024):
+                po_file.write(data)
         return file_url, local_file
 
     def _upload(self, project_id, updating, file_path, language_code=None,
